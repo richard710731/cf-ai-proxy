@@ -5,46 +5,60 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 
-const CF_ACCOUNT = process.env.CF_ACCOUNT_ID?.trim();
-const CF_TOKEN = process.env.CF_API_TOKEN?.trim();
+const CF_ACCOUNT = process.env.CF_ACCOUNT_ID? process.env.CF_ACCOUNT_ID.trim() : "";
+const CF_TOKEN = process.env.CF_API_TOKEN? process.env.CF_API_TOKEN.trim() : "";
 const PORT = process.env.PORT || 10000;
 
-app.get("/", (req, res) => res.send("V7 OK " + new Date().toISOString()));
-app.get("/v1/models", (req, res) => {
+app.get("/", function(req, res) {
+  res.send("V8 OK " + new Date().toISOString());
+});
+
+app.get("/v1/models", function(req, res) {
   res.json({
     object: "list",
     data: [
       { id: "@cf/ibm-granite/granite-4.0-h-small", object: "model", owned_by: "ibm" },
       { id: "@cf/ibm-granite/granite-4.0-h-micro", object: "model", owned_by: "ibm" },
-      { id: "@cf/meta/llama-3.1-8b-instruct-fast", object: "model", owned_by: "meta" },
-      { id: "@cf/black-forest-labs/flux-2-klein-4b", object: "model", owned_by: "black-forest" },
+      { id: "@cf/black-forest-labs/flux-2-klein-4b", object: "model", owned_by: "black-forest" }
     ]
   });
 });
 
-app.post("/v1/chat/completions", async (req, res) => {
+app.post("/v1/chat/completions", async function(req, res) {
   try {
-    const { model, messages, stream } = req.body;
-    // 改用新版 v1 端點，model 放 body，不放 URL，就不會 No route
-    const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/ai/v1/chat/completions`;
+    const model = req.body.model;
+    const messages = req.body.messages;
+    const stream = req.body.stream;
+    const cfUrl = "https://api.cloudflare.com/client/v4/accounts/" + CF_ACCOUNT + "/ai/v1/chat/completions";
 
     const cfRes = await fetch(cfUrl, {
       method: "POST",
-      headers: { Authorization: `Bearer ${CF_TOKEN}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages, stream: !!stream })
+      headers: {
+        Authorization: "Bearer " + CF_TOKEN,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ model: model, messages: messages, stream:!!stream })
     });
 
     if (!cfRes.ok) {
       const errText = await cfRes.text();
       console.error("CF CHAT ERROR:", errText);
-      return res.status(cfRes.status).json({ error: { message: `AiError: ${errText}`, type: "api_error", code: "cloudflare_api_error" } });
+      return res.status(cfRes.status).json({
+        error: { message: "AiError: " + errText, type: "api_error", code: "cloudflare_api_error" }
+      });
     }
 
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream");
       res.setHeader("Cache-Control", "no-cache");
-      // 新版 v1 回來的已經是 OpenAI 格式，直接 pipe 就好
-      cfRes.body.pipe(res);
+      res.setHeader("Connection", "keep-alive");
+      const reader = cfRes.body.getReader();
+      while (true) {
+        const result = await reader.read();
+        if (result.done) break;
+        res.write(result.value);
+      }
+      res.end();
     } else {
       const data = await cfRes.text();
       res.setHeader("Content-Type", "application/json");
@@ -56,41 +70,52 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 });
 
-app.post("/v1/images/generations", async (req, res) => {
+app.post("/v1/images/generations", async function(req, res) {
   try {
-    const { model, prompt, size = "1024x512", steps, guidance, seed, image, strength } = req.body;
-    const [w, h] = size.split("x").map(Number);
-    
-    // 生圖還是用舊的 /ai/run/ 但不要 encode
-    const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/ai/run/${model}`;
+    const model = req.body.model || "@cf/black-forest-labs/flux-2-klein-4b";
+    const prompt = req.body.prompt;
+    const size = req.body.size || "1024x512";
+    const parts = size.split("x");
+    const w = parseInt(parts[0], 10);
+    const h = parseInt(parts[1], 10);
 
-    const payload = { prompt, width: w, height: h, num_steps: steps || 20, guidance: guidance || 7.5 };
-    if (seed) payload.seed = Number(seed);
-    if (image) {
-      payload.image = image.includes(",") ? image.split(",")[1] : image;
-      payload.strength = Number(strength) || 0.8;
+    const cfUrl = "https://api.cloudflare.com/client/v4/accounts/" + CF_ACCOUNT + "/ai/run/" + model;
+
+    const payload = {
+      prompt: prompt,
+      width: w || 1024,
+      height: h || 512,
+      num_steps: req.body.steps || 20,
+      guidance: req.body.guidance || 7.5
+    };
+
+    if (req.body.seed) payload.seed = Number(req.body.seed);
+    if (req.body.image) {
+      const img = req.body.image;
+      payload.image = img.includes(",")? img.split(",")[1] : img;
+      payload.strength = Number(req.body.strength) || 0.8;
     }
 
     const cfRes = await fetch(cfUrl, {
       method: "POST",
-      headers: { Authorization: `Bearer ${CF_TOKEN}`, "Content-Type": "application/json" },
+      headers: { Authorization: "Bearer " + CF_TOKEN, "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
 
     if (!cfRes.ok) {
       const errText = await cfRes.text();
       console.error("CF IMAGE ERROR:", errText);
-      return res.status(429).json({ error: { message: `AiError: ${errText}`, type: "api_error", code: "cloudflare_api_error" } });
+      return res.status(429).json({ error: { message: "AiError: " + errText } });
     }
+
     const data = await cfRes.json();
     res.json({ created: Date.now(), data: [{ b64_json: data.result.image }] });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: { message: e.message } });
   }
 });
 
-app.listen(PORT, () => console.log(`V7 running on ${PORT}`));
-  }
+app.listen(PORT, function() {
+  console.log("V8 running on " + PORT);
 });
-
-app.listen(PORT, () => console.log(`V6 Final running on ${PORT}`));
