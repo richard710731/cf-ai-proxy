@@ -3,98 +3,107 @@ import cors from "cors";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 const CF_ACCOUNT = (process.env.CF_ACCOUNT_ID || "").trim();
 const CF_TOKEN = (process.env.CF_API_TOKEN || "").trim();
 const PORT = process.env.PORT || 10000;
 
-function normalizeMessages(msgs) {
-  return (msgs || []).map(m => {
-    let content = m.content;
-    if (Array.isArray(content)) {
-      content = content.map(c => {
-        if (typeof c === "string") return c;
-        return c.text || c.content || "";
-      }).join("\n");
-    }
-    if (typeof content !== "string") content = String(content || "");
-    return { role: m.role || "user", content: content };
-  }).filter(m => m.content);
-}
+const MODELS = {
+  QWEN: "@cf/qwen/qwen3-30b-a3b-fp8",
+  GRANITE: "@cf/ibm-granite/granite-4.0-h-micro",
+  IMAGE: "@cf/black-forest-labs/flux-2-klein-4b"
+};
 
-app.get("/", (req,res)=>res.send("V9 OK "+new Date().toISOString()));
-app.get("/v1/models", (req,res)=>{
-  res.json({ object:"list", data:[
-      { id: "@cf/meta/llama-3.1-8b-instruct-fast", object: "model", owned_by: "meta" },
-      { id: "@cf/ibm-granite/granite-4.0-h-micro", object: "model", owned_by: "ibm" },
-      { id: "@cf/black-forest-labs/flux-1-schnell", object:"model", owned_by:"black-forest"},
-      { id: "@cf/black-forest-labs/flux-2-klein-4b", object: "model", owned_by: "black-forest" }
-  ]});
+app.get("/ping", (req, res) => {
+  res.type("text/plain").send(`pong - ${MODELS.QWEN} + ${MODELS.GRANITE} + ${MODELS.IMAGE} alive - ${new Date().toISOString()}`);
 });
+app.get("/health", (req, res) => res.json({ status: "ok", models: Object.values(MODELS), time: new Date().toISOString() }));
+app.get("/", (req, res) => res.type("text/plain").send(`ready V15 qwen+granite+flux`));
+app.get("/v1/models", (req, res) => res.json({
+  object: "list",
+  data: [
+    { id: MODELS.QWEN, object: "model", owned_by: "qwen" },
+    { id: MODELS.GRANITE, object: "model", owned_by: "ibm" },
+    { id: MODELS.IMAGE, object: "model", owned_by: "black-forest" }
+  ]
+}));
 
-app.post("/v1/chat/completions", async (req,res)=>{
-  try{
-    let { model, messages, stream } = req.body;
-    messages = normalizeMessages(messages);
-    
-    // granite 用新版 v1, flux 那些不用
-    const isChatModel = model.includes("granite") || model.includes("llama") || model.includes("gemma");
-    const cfUrl = isChatModel
-      ? `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/ai/v1/chat/completions`
-      : `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/ai/run/${model}`;
+app.post("/v1/chat/completions", async (req, res) => {
+  try {
+    let model = String(req.body.model || MODELS.QWEN);
+    if (model.includes("llama") || model.includes("fast")) {
+      model = MODELS.QWEN;
+    }
+    if (model.includes("ibm/granite")) {
+      model = MODELS.GRANITE;
+    }
+    if (!model.includes("qwen") && !model.includes("granite")) {
+      model = MODELS.QWEN;
+    }
 
-    const body = isChatModel ? { model, messages, stream: !!stream } : { messages };
+    const messages = (req.body.messages || []).map(m => {
+      let c = m.content;
+      if (Array.isArray(c)) c = c.map(x => typeof x === "string" ? x : (x.text || x.content || "")).join("\n");
+      return { role: m.role || "user", content: String(c || "") };
+    }).filter(m => m.content);
 
+    console.log(`CHAT model=${model} stream=${!!req.body.stream}`);
+
+    const cfUrl = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/ai/v1/chat/completions`;
     const cfRes = await fetch(cfUrl, {
-      method:"POST",
-      headers:{ Authorization:`Bearer ${CF_TOKEN}`, "Content-Type":"application/json" },
-      body: JSON.stringify(body)
+      method: "POST",
+      headers: { Authorization: `Bearer ${CF_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, stream: !!req.body.stream })
     });
 
-    if(!cfRes.ok){
+    if (!cfRes.ok) {
       const t = await cfRes.text();
-      console.error("CF ERROR:", t);
-      return res.status(cfRes.status).json({ error:{ message:"AiError: "+t, type:"api_error", code:"cloudflare_api_error" }});
+      console.error("CF ERROR", t);
+      return res.status(cfRes.status).json({ error: { message: t } });
     }
 
-    if(stream && isChatModel){
-      res.setHeader("Content-Type","text/event-stream");
-      res.setHeader("Cache-Control","no-cache");
-      const reader = cfRes.body.getReader();
-      while(true){
-        const {done,value} = await reader.read();
-        if(done) break;
-        res.write(value);
-      }
-      res.end();
-    } else if(stream) {
-      // 舊版 /ai/run/ 的串流處理
-      res.setHeader("Content-Type","text/event-stream");
+    if (req.body.stream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
       const reader = cfRes.body.getReader();
       const decoder = new TextDecoder();
-      while(true){
-        const {done,value} = await reader.read();
-        if(done) break;
-        const chunk = decoder.decode(value,{stream:true});
-        for(const line of chunk.split("\n")){
-          if(line.startsWith("data:")){
-            try{
-              const j = JSON.parse(line.slice(5));
-              if(j.response) res.write(`data: ${JSON.stringify({choices:[{delta:{content:j.response}}]})}\n\n`);
-            }catch{ res.write(line+"\n\n"); }
-          }
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data:")) continue;
+          const p = line.slice(5).trim();
+          if (p === "[DONE]") { res.write("data: [DONE]\n\n"); continue; }
+          if (!p) continue;
+          try {
+            const j = JSON.parse(p);
+            if (j.choices?.[0]?.delta?.content != null) {
+              j.choices[0].delta.content = String(j.choices[0].delta.content);
+            }
+            if (j.choices?.[0]?.message?.content != null) {
+              j.choices[0].message.content = String(j.choices[0].message.content);
+            }
+            if (j.model) j.model = j.model.replace("-fast", "");
+            res.write(`data: ${JSON.stringify(j)}\n\n`);
+          } catch {}
         }
       }
-      res.write("data: [DONE]\n\n"); res.end();
+      res.end();
     } else {
-      const text = await cfRes.text();
-      res.setHeader("Content-Type","application/json");
-      res.send(text);
+      const txt = await cfRes.text();
+      res.setHeader("Content-Type", "application/json");
+      res.send(txt);
     }
-  }catch(e){
-    console.error(e);
-    res.status(500).json({error:{message:e.message}});
+  } catch (e) {
+    console.error("CHAT ERROR", e);
+    if (!res.headersSent) res.status(500).json({ error: { message: e.message } });
   }
 });
 
@@ -111,7 +120,7 @@ async function handleImage(req, res) {
     form.append("prompt", prompt);
     form.append("width", width);
     form.append("height", height);
-    form.append("steps", "8");
+    form.append("steps", "4");
 
     if (imgInput) {
       const b64 = String(imgInput).includes(",")? String(imgInput).split(",")[1] : String(imgInput);
@@ -145,3 +154,4 @@ app.post("/v1/images/generations", handleImage);
 app.post("/v1/images/edits", handleImage);
 
 app.listen(PORT,()=>console.log("V9 running "+PORT));
+
