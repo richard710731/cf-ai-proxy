@@ -44,10 +44,10 @@ const MODELS = {
 // Default max_tokens
 //
 // IMPORTANT:
-// These are only used when the client DOES NOT provide
+// Only used when the client does NOT provide
 // max_tokens / max_completion_tokens.
 //
-// Client-supplied value always wins.
+// Client supplied value always wins.
 // ============================================================
 
 const DEFAULT_MAX_TOKENS = {
@@ -56,7 +56,7 @@ const DEFAULT_MAX_TOKENS = {
 };
 
 // ============================================================
-// Basic validation
+// Environment warnings
 // ============================================================
 
 if (!CF_ACCOUNT) {
@@ -68,7 +68,7 @@ if (!CF_TOKEN) {
 }
 
 // ============================================================
-// Root / Health
+// Basic routes
 // ============================================================
 
 app.get("/ping", (req, res) => {
@@ -90,17 +90,16 @@ app.get("/health", (req, res) => {
 app.get("/", (req, res) => {
   res
     .type("text/plain")
-    .send("ready V17 qwen+granite+flux");
+    .send("ready V18 qwen+granite+flux");
 });
 
 // ============================================================
-// OpenAI-compatible models endpoint
+// OpenAI-compatible /v1/models
 // ============================================================
 
 app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
-
     data: [
       {
         id: MODELS.QWEN,
@@ -130,7 +129,7 @@ function resolveChatModel(inputModel) {
     inputModel || MODELS.QWEN
   ).trim();
 
-  // Compatibility aliases
+  // Existing compatibility rules
   if (
     model.includes("llama") ||
     model.includes("fast")
@@ -146,7 +145,7 @@ function resolveChatModel(inputModel) {
     model = MODELS.GRANITE;
   }
 
-  // Only allow Qwen / Granite in chat endpoint
+  // Only Qwen / Granite allowed on chat endpoint
   if (
     !model.includes("qwen") &&
     !model.includes("granite")
@@ -161,35 +160,34 @@ function resolveChatModel(inputModel) {
 // Resolve max_tokens
 //
 // Priority:
-//   1. max_completion_tokens
-//   2. max_tokens
-//   3. model-specific default
+//
+// 1. max_completion_tokens
+// 2. max_tokens
+// 3. model-specific default
 //
 // IMPORTANT:
-// If client supplies a valid value, DO NOT overwrite it.
+// Never overwrite a valid client supplied value.
 // ============================================================
 
 function resolveMaxTokens(reqBody, model) {
   let rawValue = null;
 
-  // Newer OpenAI-compatible clients
   if (
     reqBody?.max_completion_tokens !== undefined &&
     reqBody?.max_completion_tokens !== null
   ) {
-    rawValue = reqBody.max_completion_tokens;
-  }
-
-  // Traditional OpenAI parameter
-  else if (
+    rawValue =
+      reqBody.max_completion_tokens;
+  } else if (
     reqBody?.max_tokens !== undefined &&
     reqBody?.max_tokens !== null
   ) {
-    rawValue = reqBody.max_tokens;
+    rawValue =
+      reqBody.max_tokens;
   }
 
   // ----------------------------------------------------------
-  // Client specified a value
+  // Client explicitly supplied max tokens
   // ----------------------------------------------------------
 
   if (rawValue !== null) {
@@ -209,7 +207,7 @@ function resolveMaxTokens(reqBody, model) {
   }
 
   // ----------------------------------------------------------
-  // No valid client value -> defaults
+  // No valid client value -> model default
   // ----------------------------------------------------------
 
   if (model.includes("granite")) {
@@ -224,10 +222,17 @@ function resolveMaxTokens(reqBody, model) {
 }
 
 // ============================================================
-// Normalize messages
+// Normalize incoming messages
 //
-// Cherry Studio / OpenAI-compatible clients may send
-// content either as a string or an array.
+// Handles:
+//
+// content: "hello"
+//
+// or:
+//
+// content: [
+//   { type: "text", text: "hello" }
+// ]
 // ============================================================
 
 function normalizeMessages(inputMessages) {
@@ -238,10 +243,6 @@ function normalizeMessages(inputMessages) {
   return inputMessages
     .map((m) => {
       let content = m?.content;
-
-      // --------------------------------------------------------
-      // Array content
-      // --------------------------------------------------------
 
       if (Array.isArray(content)) {
         content = content
@@ -269,21 +270,15 @@ function normalizeMessages(inputMessages) {
           .join("\n");
       }
 
-      // --------------------------------------------------------
-      // Normal string
-      // --------------------------------------------------------
-
       return {
         role: String(
           m?.role || "user"
         ),
-
         content: String(
           content ?? ""
         )
       };
     })
-
     .filter(
       (m) =>
         m.content.length > 0
@@ -291,19 +286,142 @@ function normalizeMessages(inputMessages) {
 }
 
 // ============================================================
-// Forward generation parameters
+// Normalize Cloudflare/OpenAI-compatible response
 //
-// These parameters are supported by Cloudflare's current
-// Qwen3 / Granite model schemas.
+// IMPORTANT QWEN FIX:
 //
-// stream_options is forwarded because OpenAI-compatible clients
-// such as Cherry Studio may send:
+// Cloudflare Qwen can return:
+//
 // {
-//   "include_usage": true
+//   "delta": {
+//      "content": 1
+//   }
 // }
+//
+// Cherry Studio expects:
+//
+// {
+//   "delta": {
+//      "content": "1"
+//   }
+// }
+//
+// We normalize non-string scalar values to strings.
+//
+// We DO NOT remove usage, reasoning_content, token_ids, etc.
 // ============================================================
 
-function buildPayload(reqBody, model, messages, isStream) {
+function normalizeChatResponseObject(obj) {
+  if (
+    !obj ||
+    typeof obj !== "object"
+  ) {
+    return obj;
+  }
+
+  // ----------------------------------------------------------
+  // choices
+  // ----------------------------------------------------------
+
+  if (
+    Array.isArray(obj.choices)
+  ) {
+    obj.choices =
+      obj.choices.map(
+        (choice) => {
+          if (
+            !choice ||
+            typeof choice !== "object"
+          ) {
+            return choice;
+          }
+
+          // --------------------------------------------------
+          // delta
+          // --------------------------------------------------
+
+          if (
+            choice.delta &&
+            typeof choice.delta === "object"
+          ) {
+            const delta =
+              choice.delta;
+
+            if (
+              delta.content !== undefined &&
+              delta.content !== null &&
+              typeof delta.content !== "string"
+            ) {
+              delta.content =
+                String(
+                  delta.content
+                );
+            }
+
+            if (
+              delta.reasoning_content !== undefined &&
+              delta.reasoning_content !== null &&
+              typeof delta.reasoning_content !== "string"
+            ) {
+              delta.reasoning_content =
+                String(
+                  delta.reasoning_content
+                );
+            }
+          }
+
+          // --------------------------------------------------
+          // message
+          // --------------------------------------------------
+
+          if (
+            choice.message &&
+            typeof choice.message === "object"
+          ) {
+            const message =
+              choice.message;
+
+            if (
+              message.content !== undefined &&
+              message.content !== null &&
+              typeof message.content !== "string"
+            ) {
+              message.content =
+                String(
+                  message.content
+                );
+            }
+
+            if (
+              message.reasoning_content !== undefined &&
+              message.reasoning_content !== null &&
+              typeof message.reasoning_content !== "string"
+            ) {
+              message.reasoning_content =
+                String(
+                  message.reasoning_content
+                );
+            }
+          }
+
+          return choice;
+        }
+      );
+  }
+
+  return obj;
+}
+
+// ============================================================
+// Build Cloudflare chat payload
+// ============================================================
+
+function buildChatPayload(
+  reqBody,
+  model,
+  messages,
+  isStream
+) {
   const maxTokens =
     resolveMaxTokens(
       reqBody,
@@ -318,7 +436,7 @@ function buildPayload(reqBody, model, messages, isStream) {
   };
 
   // ----------------------------------------------------------
-  // Supported generation parameters
+  // Forward supported generation parameters
   // ----------------------------------------------------------
 
   const forwardParams = [
@@ -357,6 +475,7 @@ function buildPayload(reqBody, model, messages, isStream) {
 app.post(
   "/v1/chat/completions",
   async (req, res) => {
+
     const isStream =
       req.body?.stream === true;
 
@@ -379,11 +498,11 @@ app.post(
       );
 
     // --------------------------------------------------------
-    // Build Cloudflare payload
+    // Build payload
     // --------------------------------------------------------
 
     const payload =
-      buildPayload(
+      buildChatPayload(
         req.body,
         model,
         messages,
@@ -391,7 +510,7 @@ app.post(
       );
 
     // --------------------------------------------------------
-    // IMPORTANT DEBUG LOG
+    // Debug log
     // --------------------------------------------------------
 
     console.log(
@@ -436,7 +555,8 @@ app.post(
       "Input chars:",
       messages.reduce(
         (total, m) =>
-          total + m.content.length,
+          total +
+          m.content.length,
         0
       )
     );
@@ -477,7 +597,7 @@ app.post(
       `${CF_ACCOUNT}/ai/v1/chat/completions`;
 
     // --------------------------------------------------------
-    // Abort upstream if client disconnects
+    // Abort upstream when client disconnects
     // --------------------------------------------------------
 
     const controller =
@@ -490,7 +610,7 @@ app.post(
           !res.writableEnded
         ) {
           console.warn(
-            "CLIENT DISCONNECTED -> aborting Cloudflare request"
+            "CLIENT DISCONNECTED -> abort Cloudflare request"
           );
 
           controller.abort();
@@ -499,11 +619,13 @@ app.post(
     );
 
     try {
+
       // ======================================================
-      // STREAM MODE
+      // STREAMING
       // ======================================================
 
       if (isStream) {
+
         // ----------------------------------------------------
         // SSE headers
         // ----------------------------------------------------
@@ -530,7 +652,7 @@ app.post(
           "no"
         );
 
-        // Flush HTTP headers immediately
+        // Flush immediately
         if (
           typeof res.flushHeaders ===
           "function"
@@ -539,7 +661,7 @@ app.post(
         }
 
         // ----------------------------------------------------
-        // Call Cloudflare
+        // Cloudflare streaming request
         // ----------------------------------------------------
 
         const cfRes =
@@ -582,10 +704,11 @@ app.post(
         );
 
         // ----------------------------------------------------
-        // Cloudflare error before stream starts
+        // Cloudflare error
         // ----------------------------------------------------
 
         if (!cfRes.ok) {
+
           const errorText =
             await cfRes.text();
 
@@ -597,7 +720,7 @@ app.post(
           if (
             !res.writableEnded
           ) {
-            // SSE-compatible error
+
             res.write(
               `data: ${JSON.stringify(
                 {
@@ -622,17 +745,19 @@ app.post(
         }
 
         // ----------------------------------------------------
-        // Empty upstream body
+        // Empty body
         // ----------------------------------------------------
 
         if (!cfRes.body) {
+
           console.error(
-            "CF STREAM ERROR: no response body"
+            "CF STREAM ERROR: empty response body"
           );
 
           if (
             !res.writableEnded
           ) {
+
             res.write(
               `data: ${JSON.stringify(
                 {
@@ -655,31 +780,35 @@ app.post(
         }
 
         // ----------------------------------------------------
-        // RAW SSE RELAY
+        // SSE compatibility parser
         //
-        // IMPORTANT:
+        // We parse SSE only so we can normalize Qwen
+        // non-string delta.content.
         //
-        // We do NOT JSON.parse()
-        // We do NOT modify delta.content
-        // We do NOT modify usage
-        // We do NOT modify reasoning_content
-        // We do NOT rebuild SSE messages
-        //
-        // Cloudflare -> Render -> Cherry Studio
+        // We preserve:
+        //   usage
+        //   finish_reason
+        //   reasoning_content
+        //   token_ids
+        //   model
+        //   id
+        //   created
+        //   other fields
         // ----------------------------------------------------
 
         const reader =
           cfRes.body.getReader();
 
-        let receivedDone =
-          false;
-
         const decoder =
           new TextDecoder();
 
-        let detectBuffer = "";
+        let buffer = "";
+
+        let receivedDone =
+          false;
 
         while (true) {
+
           const {
             done,
             value
@@ -694,80 +823,242 @@ app.post(
             continue;
           }
 
-          // --------------------------------------------------
-          // Relay original bytes
-          // --------------------------------------------------
-
-          if (
-            !res.writableEnded
-          ) {
-            res.write(
-              Buffer.from(value)
+          buffer +=
+            decoder.decode(
+              value,
+              {
+                stream: true
+              }
             );
-          }
 
           // --------------------------------------------------
-          // Detect [DONE]
+          // SSE normally uses blank line to terminate event.
           //
-          // This is ONLY for logging.
-          // The actual SSE data is never modified.
+          // Process complete lines.
           // --------------------------------------------------
 
-          try {
-            const text =
-              decoder.decode(
-                value,
-                {
-                  stream: true
-                }
-              );
+          const lines =
+            buffer.split(
+              /\r?\n/
+            );
 
-            detectBuffer +=
-              text;
+          // Keep incomplete final line
+          buffer =
+            lines.pop() || "";
+
+          for (
+            const line of lines
+          ) {
+
+            // ------------------------------------------------
+            // Empty SSE separator
+            // ------------------------------------------------
 
             if (
-              detectBuffer.includes(
-                "data: [DONE]"
+              line.trim() === ""
+            ) {
+              continue;
+            }
+
+            // ------------------------------------------------
+            // SSE comment
+            // ------------------------------------------------
+
+            if (
+              line.startsWith(":")
+            ) {
+              // We don't need to forward provider comments.
+              continue;
+            }
+
+            // ------------------------------------------------
+            // Ignore non-data SSE fields
+            // ------------------------------------------------
+
+            if (
+              !line.startsWith(
+                "data:"
               )
             ) {
-              receivedDone =
-                true;
+              continue;
             }
 
-            // Prevent buffer growth
+            const data =
+              line
+                .slice(5)
+                .trim();
+
+            // ------------------------------------------------
+            // DONE
+            // ------------------------------------------------
+
             if (
-              detectBuffer.length >
-              2000
+              data === "[DONE]"
             ) {
-              detectBuffer =
-                detectBuffer.slice(
-                  -2000
+
+              receivedDone =
+                true;
+
+              if (
+                !res.writableEnded
+              ) {
+                res.write(
+                  "data: [DONE]\n\n"
                 );
+              }
+
+              continue;
             }
-          } catch (e) {
-            // Detection failure must never break streaming.
+
+            if (!data) {
+              continue;
+            }
+
+            // ------------------------------------------------
+            // Parse JSON
+            // ------------------------------------------------
+
+            let chunk;
+
+            try {
+
+              chunk =
+                JSON.parse(
+                  data
+                );
+
+            } catch (e) {
+
+              console.warn(
+                "Skipping malformed SSE JSON:",
+                data
+              );
+
+              continue;
+            }
+
+            // ------------------------------------------------
+            // Normalize ONLY compatibility-sensitive fields
+            // ------------------------------------------------
+
+            chunk =
+              normalizeChatResponseObject(
+                chunk
+              );
+
+            // ------------------------------------------------
+            // Forward normalized chunk
+            // ------------------------------------------------
+
+            if (
+              !res.writableEnded
+            ) {
+
+              res.write(
+                `data: ${JSON.stringify(
+                  chunk
+                )}\n\n`
+              );
+            }
           }
         }
 
-        console.log(
-          "CF STREAM ENDED. DONE RECEIVED:",
-          receivedDone
-        );
+        // ----------------------------------------------------
+        // Flush remaining buffered data
+        // ----------------------------------------------------
+
+        buffer +=
+          decoder.decode();
+
+        if (
+          buffer.trim()
+        ) {
+
+          const remaining =
+            buffer.split(
+              /\r?\n/
+            );
+
+          for (
+            const line of remaining
+          ) {
+
+            if (
+              !line.startsWith(
+                "data:"
+              )
+            ) {
+              continue;
+            }
+
+            const data =
+              line
+                .slice(5)
+                .trim();
+
+            if (
+              data === "[DONE]"
+            ) {
+
+              receivedDone =
+                true;
+
+              if (
+                !res.writableEnded
+              ) {
+                res.write(
+                  "data: [DONE]\n\n"
+                );
+              }
+
+              continue;
+            }
+
+            if (!data) {
+              continue;
+            }
+
+            try {
+
+              let chunk =
+                JSON.parse(
+                  data
+                );
+
+              chunk =
+                normalizeChatResponseObject(
+                  chunk
+                );
+
+              if (
+                !res.writableEnded
+              ) {
+                res.write(
+                  `data: ${JSON.stringify(
+                    chunk
+                  )}\n\n`
+                );
+              }
+
+            } catch (e) {
+
+              console.warn(
+                "Skipping final malformed SSE JSON:",
+                data
+              );
+            }
+          }
+        }
 
         // ----------------------------------------------------
-        // IMPORTANT:
-        //
-        // Normally Cloudflare sends [DONE], which we already
-        // relay unchanged.
-        //
-        // If Cloudflare closes without [DONE], append one
-        // OpenAI-compatible DONE event.
+        // Append DONE only if Cloudflare omitted it
         // ----------------------------------------------------
 
         if (
           !receivedDone &&
           !res.writableEnded
         ) {
+
           console.warn(
             "WARNING: Cloudflare stream ended without [DONE]"
           );
@@ -783,11 +1074,16 @@ app.post(
           res.end();
         }
 
+        console.log(
+          "CF STREAM ENDED. DONE RECEIVED:",
+          receivedDone
+        );
+
         return;
       }
 
       // ======================================================
-      // NON-STREAM MODE
+      // NON-STREAMING
       // ======================================================
 
       const cfRes =
@@ -830,6 +1126,7 @@ app.post(
       // ------------------------------------------------------
 
       if (!cfRes.ok) {
+
         console.error(
           "CF ERROR:",
           text
@@ -841,37 +1138,70 @@ app.post(
           )
           .json({
             error: {
-              message: text
+              message:
+                text
             }
           });
       }
 
       // ------------------------------------------------------
-      // Successful response
+      // Normalize JSON response
+      //
+      // This protects Cherry from the same content type issue
+      // if Qwen ever returns numeric message.content.
       // ------------------------------------------------------
 
-      res.setHeader(
-        "Content-Type",
-        "application/json"
-      );
+      try {
 
-      res.send(text);
+        let data =
+          JSON.parse(
+            text
+          );
+
+        data =
+          normalizeChatResponseObject(
+            data
+          );
+
+        res.setHeader(
+          "Content-Type",
+          "application/json"
+        );
+
+        return res.json(
+          data
+        );
+
+      } catch (e) {
+
+        // If Cloudflare returned something unexpected,
+        // preserve the original response.
+        res.setHeader(
+          "Content-Type",
+          "application/json"
+        );
+
+        return res.send(
+          text
+        );
+      }
 
     } catch (e) {
-      // ======================================================
-      // Error handling
-      // ======================================================
 
       console.error(
         "CHAT ERROR:",
         e
       );
 
-      // Client disconnected
+      // ------------------------------------------------------
+      // AbortError = client disconnected
+      // ------------------------------------------------------
+
       if (
         e?.name ===
         "AbortError"
       ) {
+
         console.warn(
           "Cloudflare request aborted because client disconnected."
         );
@@ -884,10 +1214,12 @@ app.post(
       // ------------------------------------------------------
 
       if (isStream) {
+
         if (
           !res.headersSent
         ) {
-          res
+
+          return res
             .status(500)
             .json({
               error: {
@@ -897,10 +1229,14 @@ app.post(
               }
             });
 
-        } else if (
+        }
+
+        if (
           !res.writableEnded
         ) {
+
           try {
+
             res.write(
               `data: ${JSON.stringify(
                 {
@@ -920,7 +1256,7 @@ app.post(
             res.end();
 
           } catch (_) {
-            // Connection already closed.
+            // Connection already closed
           }
         }
 
@@ -928,13 +1264,14 @@ app.post(
       }
 
       // ------------------------------------------------------
-      // Normal request error
+      // Non-streaming error
       // ------------------------------------------------------
 
       if (
         !res.headersSent
       ) {
-        res
+
+        return res
           .status(500)
           .json({
             error: {
@@ -951,14 +1288,16 @@ app.post(
 // ============================================================
 // FLUX.2 Klein 4B IMAGE HANDLER
 //
-// Kept separate from chat route.
+// Kept independent from Qwen / Granite chat route.
 // ============================================================
 
 async function handleImage(
   req,
   res
 ) {
+
   try {
+
     const model =
       MODELS.IMAGE;
 
@@ -1016,7 +1355,7 @@ async function handleImage(
       height
     );
 
-    // FLUX.2 Klein 4B uses 4 inference steps
+    // FLUX.2 Klein 4B
     form.append(
       "steps",
       "4"
@@ -1027,8 +1366,11 @@ async function handleImage(
     // --------------------------------------------------------
 
     if (imgInput) {
+
       const inputString =
-        String(imgInput);
+        String(
+          imgInput
+        );
 
       const b64 =
         inputString.includes(",")
@@ -1046,7 +1388,8 @@ async function handleImage(
         new Blob(
           [buffer],
           {
-            type: "image/jpeg"
+            type:
+              "image/jpeg"
           }
         ),
         "input.jpg"
@@ -1091,11 +1434,12 @@ async function handleImage(
               `Bearer ${CF_TOKEN}`
 
             // IMPORTANT:
-            // Do NOT set Content-Type manually.
-            // fetch() creates the multipart boundary.
+            // Do not set Content-Type manually.
+            // fetch() generates the multipart boundary.
           },
 
-          body: form
+          body:
+            form
         }
       );
 
@@ -1108,10 +1452,11 @@ async function handleImage(
     );
 
     // --------------------------------------------------------
-    // Cloudflare image error
+    // Cloudflare FLUX error
     // --------------------------------------------------------
 
     if (!cfRes.ok) {
+
       console.error(
         "CF KLEIN ERROR:",
         text
@@ -1123,20 +1468,24 @@ async function handleImage(
         )
         .json({
           error: {
-            message: text
+            message:
+              text
           }
         });
     }
 
     // --------------------------------------------------------
-    // Parse JSON
+    // Parse image response
     // --------------------------------------------------------
 
     let data;
 
     try {
+
       data =
-        JSON.parse(text);
+        JSON.parse(
+          text
+        );
 
     } catch (e) {
 
@@ -1156,10 +1505,10 @@ async function handleImage(
     }
 
     // --------------------------------------------------------
-    // OpenAI-style image response
+    // OpenAI-compatible image response
     // --------------------------------------------------------
 
-    res.json({
+    return res.json({
       created:
         Date.now(),
 
@@ -1173,6 +1522,7 @@ async function handleImage(
     });
 
   } catch (e) {
+
     console.error(
       "FINAL IMAGE ERROR:",
       e
@@ -1181,7 +1531,8 @@ async function handleImage(
     if (
       !res.headersSent
     ) {
-      res
+
+      return res
         .status(500)
         .json({
           error: {
@@ -1195,7 +1546,7 @@ async function handleImage(
 }
 
 // ============================================================
-// IMAGE ENDPOINTS
+// Image endpoints
 // ============================================================
 
 app.post(
@@ -1209,18 +1560,26 @@ app.post(
 );
 
 // ============================================================
-// JSON parser / application error handler
+// Express JSON parser error handler
 //
-// This converts Express default HTML 400 responses into JSON.
+// Prevent default HTML:
+// <pre>Bad Request</pre>
 // ============================================================
 
 app.use(
-  (err, req, res, next) => {
+  (
+    err,
+    req,
+    res,
+    next
+  ) => {
+
     if (
       err instanceof SyntaxError &&
       err?.status === 400 &&
       "body" in err
     ) {
+
       console.error(
         "INVALID JSON BODY:",
         err.message
@@ -1232,6 +1591,7 @@ app.use(
           error: {
             message:
               "Invalid JSON request body",
+
             detail:
               err.message
           }
@@ -1264,18 +1624,19 @@ app.use(
 );
 
 // ============================================================
-// Start
+// Start server
 // ============================================================
 
 app.listen(
   PORT,
   () => {
+
     console.log(
       "=================================================="
     );
 
     console.log(
-      `V17 running on port ${PORT}`
+      `V18 running on port ${PORT}`
     );
 
     console.log(
