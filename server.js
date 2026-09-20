@@ -4,6 +4,20 @@ import cors from "cors";
 const app = express();
 
 // ============================================================
+// V19
+// Qwen3 + Granite + FLUX.2 Klein 4B
+//
+// Main improvements:
+//   1. Model-aware context/output budgets
+//   2. Dynamic max_tokens based on estimated input size
+//   3. Client max_tokens / max_completion_tokens supported
+//   4. Qwen numeric delta.content -> string normalization
+//   5. Cherry Studio SSE compatibility
+//   6. Function-calling fields preserved
+//   7. FLUX routes kept separate
+// ============================================================
+
+// ============================================================
 // Middleware
 // ============================================================
 
@@ -26,9 +40,16 @@ app.use(
 // Environment
 // ============================================================
 
-const CF_ACCOUNT = (process.env.CF_ACCOUNT_ID || "").trim();
-const CF_TOKEN = (process.env.CF_API_TOKEN || "").trim();
-const PORT = process.env.PORT || 10000;
+const CF_ACCOUNT = (
+  process.env.CF_ACCOUNT_ID || ""
+).trim();
+
+const CF_TOKEN = (
+  process.env.CF_API_TOKEN || ""
+).trim();
+
+const PORT =
+  process.env.PORT || 10000;
 
 // ============================================================
 // Models
@@ -41,34 +62,119 @@ const MODELS = {
 };
 
 // ============================================================
-// Default max_tokens
+// Model configuration
 //
 // IMPORTANT:
-// Only used when the client does NOT provide
-// max_tokens / max_completion_tokens.
 //
-// Client supplied value always wins.
+// contextWindow = official model context window
+//
+// defaultMaxTokens = used only when client gives no
+// max_tokens / max_completion_tokens
+//
+// maxOutputTokens = our practical safety cap
+//
+// inputReserveTokens = safety margin for token estimation
+//
+// Qwen official context: 32,768
+// Granite official context: 131,000
 // ============================================================
 
-const DEFAULT_MAX_TOKENS = {
-  QWEN: 4096,
-  GRANITE: 4096
+const MODEL_CONFIG = {
+  [MODELS.QWEN]: {
+    name: "Qwen3 30B A3B FP8",
+
+    contextWindow: 32768,
+
+    defaultMaxTokens: 8192,
+
+    maxOutputTokens: 16384,
+
+    inputReserveTokens: 1024
+  },
+
+  [MODELS.GRANITE]: {
+    name: "Granite 4.0 H Micro",
+
+    contextWindow: 131000,
+
+    defaultMaxTokens: 16384,
+
+    maxOutputTokens: 32768,
+
+    inputReserveTokens: 1024
+  }
 };
+
+// ============================================================
+// Token estimation
+//
+// We intentionally do NOT pretend this is an exact tokenizer.
+//
+// Because the proxy does not load the actual model tokenizer,
+// we use a conservative character-based estimate.
+//
+// Approximation:
+//   estimated tokens ~= chars / 2.5
+//
+// This is intentionally conservative for:
+//   Chinese
+//   source code
+//   JSON
+//   mixed-language prompts
+//
+// The goal is not exact billing.
+// The goal is preventing:
+//   input + output > context window
+// ============================================================
+
+const CHARS_PER_TOKEN_ESTIMATE = 2.5;
+
+function estimateInputTokens(messages) {
+  if (!Array.isArray(messages)) {
+    return 0;
+  }
+
+  const totalChars =
+    messages.reduce(
+      (sum, message) =>
+        sum +
+        String(
+          message?.content || ""
+        ).length,
+      0
+    );
+
+  // Small overhead for role/message boundaries
+  const messageOverhead =
+    messages.length * 8;
+
+  const estimated =
+    Math.ceil(
+      totalChars /
+        CHARS_PER_TOKEN_ESTIMATE
+    ) + messageOverhead;
+
+  return estimated;
+}
 
 // ============================================================
 // Environment warnings
 // ============================================================
 
 if (!CF_ACCOUNT) {
-  console.warn("WARNING: CF_ACCOUNT_ID is not configured");
+  console.warn(
+    "WARNING: CF_ACCOUNT_ID is not configured"
+  );
 }
 
 if (!CF_TOKEN) {
-  console.warn("WARNING: CF_API_TOKEN is not configured");
+  console.warn(
+    "WARNING: CF_API_TOKEN is not configured"
+  );
 }
 
 // ============================================================
-// Basic routes
+// Basic endpoints
 // ============================================================
 
 app.get("/ping", (req, res) => {
@@ -90,7 +196,9 @@ app.get("/health", (req, res) => {
 app.get("/", (req, res) => {
   res
     .type("text/plain")
-    .send("ready V18 qwen+granite+flux");
+    .send(
+      "ready V19 qwen+granite+flux"
+    );
 });
 
 // ============================================================
@@ -100,6 +208,7 @@ app.get("/", (req, res) => {
 app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
+
     data: [
       {
         id: MODELS.QWEN,
@@ -129,7 +238,7 @@ function resolveChatModel(inputModel) {
     inputModel || MODELS.QWEN
   ).trim();
 
-  // Existing compatibility rules
+  // Existing compatibility
   if (
     model.includes("llama") ||
     model.includes("fast")
@@ -145,7 +254,7 @@ function resolveChatModel(inputModel) {
     model = MODELS.GRANITE;
   }
 
-  // Only Qwen / Granite allowed on chat endpoint
+  // Only Qwen / Granite allowed
   if (
     !model.includes("qwen") &&
     !model.includes("granite")
@@ -157,164 +266,299 @@ function resolveChatModel(inputModel) {
 }
 
 // ============================================================
-// Resolve max_tokens
+// Resolve requested max_tokens
 //
 // Priority:
 //
-// 1. max_completion_tokens
-// 2. max_tokens
-// 3. model-specific default
+//   1. max_completion_tokens
+//   2. max_tokens
+//   3. null = no client value
 //
-// IMPORTANT:
-// Never overwrite a valid client supplied value.
+// We intentionally return null when the client didn't specify
+// anything, because dynamic calculation happens later.
 // ============================================================
 
-function resolveMaxTokens(reqBody, model) {
+function getClientRequestedMaxTokens(
+  reqBody
+) {
   let rawValue = null;
 
   if (
-    reqBody?.max_completion_tokens !== undefined &&
-    reqBody?.max_completion_tokens !== null
+    reqBody?.max_completion_tokens !==
+      undefined &&
+    reqBody?.max_completion_tokens !==
+      null
   ) {
     rawValue =
       reqBody.max_completion_tokens;
   } else if (
-    reqBody?.max_tokens !== undefined &&
-    reqBody?.max_tokens !== null
+    reqBody?.max_tokens !==
+      undefined &&
+    reqBody?.max_tokens !==
+      null
   ) {
     rawValue =
       reqBody.max_tokens;
   }
 
-  // ----------------------------------------------------------
-  // Client explicitly supplied max tokens
-  // ----------------------------------------------------------
+  if (rawValue === null) {
+    return null;
+  }
 
-  if (rawValue !== null) {
-    const n = Number(rawValue);
+  const numberValue =
+    Number(rawValue);
 
-    if (
-      Number.isFinite(n) &&
-      n > 0
-    ) {
-      return Math.floor(n);
-    }
-
+  if (
+    !Number.isFinite(
+      numberValue
+    ) ||
+    numberValue <= 0
+  ) {
     console.warn(
-      "Invalid max_tokens received:",
+      "Invalid client max_tokens:",
       rawValue
     );
+
+    return null;
   }
 
-  // ----------------------------------------------------------
-  // No valid client value -> model default
-  // ----------------------------------------------------------
-
-  if (model.includes("granite")) {
-    return DEFAULT_MAX_TOKENS.GRANITE;
-  }
-
-  if (model.includes("qwen")) {
-    return DEFAULT_MAX_TOKENS.QWEN;
-  }
-
-  return 4096;
+  return Math.floor(
+    numberValue
+  );
 }
 
 // ============================================================
-// Normalize incoming messages
+// Calculate safe max_tokens
 //
-// Handles:
+// Rules:
 //
-// content: "hello"
+// 1. Client value is honored when possible.
+// 2. Never exceed our model safety cap.
+// 3. Never exceed remaining estimated context.
+// 4. If no client value, use model default.
+// 5. If remaining context is too small, return error info.
 //
-// or:
-//
-// content: [
-//   { type: "text", text: "hello" }
-// ]
+// IMPORTANT:
+// This is an estimate, not an exact tokenizer calculation.
 // ============================================================
 
-function normalizeMessages(inputMessages) {
-  if (!Array.isArray(inputMessages)) {
+function calculateMaxTokens(
+  model,
+  messages,
+  reqBody
+) {
+  const config =
+    MODEL_CONFIG[model];
+
+  if (!config) {
+    return {
+      maxTokens: 4096,
+      estimatedInputTokens: 0,
+      availableOutputTokens: 4096,
+      clientRequested: null,
+      error: null
+    };
+  }
+
+  const estimatedInputTokens =
+    estimateInputTokens(
+      messages
+    );
+
+  const availableOutputTokens =
+    Math.max(
+      0,
+      config.contextWindow -
+        estimatedInputTokens -
+        config.inputReserveTokens
+    );
+
+  const clientRequested =
+    getClientRequestedMaxTokens(
+      reqBody
+    );
+
+  let requested;
+
+  if (
+    clientRequested !== null
+  ) {
+    requested =
+      clientRequested;
+  } else {
+    requested =
+      config.defaultMaxTokens;
+  }
+
+  // Never exceed practical safety cap
+  requested =
+    Math.min(
+      requested,
+      config.maxOutputTokens
+    );
+
+  // Never exceed remaining context
+  requested =
+    Math.min(
+      requested,
+      availableOutputTokens
+    );
+
+  // A very small remaining output space is not useful
+  if (
+    requested < 1
+  ) {
+    return {
+      maxTokens: 0,
+
+      estimatedInputTokens,
+
+      availableOutputTokens,
+
+      clientRequested,
+
+      error:
+        `Input is too large for ${config.name}. ` +
+        `Estimated input: ${estimatedInputTokens} tokens, ` +
+        `context window: ${config.contextWindow} tokens.`
+    };
+  }
+
+  return {
+    maxTokens:
+      Math.floor(requested),
+
+    estimatedInputTokens,
+
+    availableOutputTokens,
+
+    clientRequested,
+
+    error: null
+  };
+}
+
+// ============================================================
+// Normalize input messages
+// ============================================================
+
+function normalizeMessages(
+  inputMessages
+) {
+  if (
+    !Array.isArray(
+      inputMessages
+    )
+  ) {
     return [];
   }
 
   return inputMessages
-    .map((m) => {
-      let content = m?.content;
+    .map((message) => {
+      let content =
+        message?.content;
 
-      if (Array.isArray(content)) {
-        content = content
-          .map((item) => {
-            if (typeof item === "string") {
-              return item;
-            }
+      // --------------------------------------------------------
+      // OpenAI content array
+      // --------------------------------------------------------
 
-            if (
-              item?.text !== undefined &&
-              item?.text !== null
-            ) {
-              return String(item.text);
-            }
+      if (
+        Array.isArray(
+          content
+        )
+      ) {
+        content =
+          content
+            .map(
+              (item) => {
+                if (
+                  typeof item ===
+                  "string"
+                ) {
+                  return item;
+                }
 
-            if (
-              item?.content !== undefined &&
-              item?.content !== null
-            ) {
-              return String(item.content);
-            }
+                if (
+                  item?.text !==
+                    undefined &&
+                  item?.text !==
+                    null
+                ) {
+                  return String(
+                    item.text
+                  );
+                }
 
-            return "";
-          })
-          .join("\n");
+                if (
+                  item?.content !==
+                    undefined &&
+                  item?.content !==
+                    null
+                ) {
+                  return String(
+                    item.content
+                  );
+                }
+
+                return "";
+              }
+            )
+            .join("\n");
       }
 
       return {
         role: String(
-          m?.role || "user"
+          message?.role ||
+            "user"
         ),
+
         content: String(
           content ?? ""
         )
       };
     })
+
     .filter(
-      (m) =>
-        m.content.length > 0
+      (message) =>
+        message.content
+          .length > 0
     );
 }
 
 // ============================================================
-// Normalize Cloudflare/OpenAI-compatible response
+// Normalize Cloudflare response object
 //
-// IMPORTANT QWEN FIX:
+// PRIMARY FIX:
 //
-// Cloudflare Qwen can return:
+// Qwen may return:
 //
-// {
-//   "delta": {
-//      "content": 1
-//   }
-// }
+//   delta.content = 1
 //
 // Cherry Studio expects:
 //
-// {
-//   "delta": {
-//      "content": "1"
-//   }
-// }
+//   delta.content = "1"
 //
-// We normalize non-string scalar values to strings.
+// We convert non-string primitive values to strings.
 //
-// We DO NOT remove usage, reasoning_content, token_ids, etc.
+// We preserve:
+//   null
+//   usage
+//   reasoning_content
+//   token_ids
+//   tool_calls
+//   finish_reason
+//   model
+//   id
+//   created
 // ============================================================
 
-function normalizeChatResponseObject(obj) {
+function normalizeChatResponseObject(
+  obj
+) {
   if (
     !obj ||
-    typeof obj !== "object"
+    typeof obj !==
+      "object"
   ) {
     return obj;
   }
@@ -324,14 +568,17 @@ function normalizeChatResponseObject(obj) {
   // ----------------------------------------------------------
 
   if (
-    Array.isArray(obj.choices)
+    Array.isArray(
+      obj.choices
+    )
   ) {
     obj.choices =
       obj.choices.map(
         (choice) => {
           if (
             !choice ||
-            typeof choice !== "object"
+            typeof choice !==
+              "object"
           ) {
             return choice;
           }
@@ -342,15 +589,20 @@ function normalizeChatResponseObject(obj) {
 
           if (
             choice.delta &&
-            typeof choice.delta === "object"
+            typeof choice.delta ===
+              "object"
           ) {
             const delta =
               choice.delta;
 
+            // Qwen numeric content fix
             if (
-              delta.content !== undefined &&
-              delta.content !== null &&
-              typeof delta.content !== "string"
+              delta.content !==
+                undefined &&
+              delta.content !==
+                null &&
+              typeof delta.content !==
+                "string"
             ) {
               delta.content =
                 String(
@@ -358,10 +610,14 @@ function normalizeChatResponseObject(obj) {
                 );
             }
 
+            // reasoning_content
             if (
-              delta.reasoning_content !== undefined &&
-              delta.reasoning_content !== null &&
-              typeof delta.reasoning_content !== "string"
+              delta.reasoning_content !==
+                undefined &&
+              delta.reasoning_content !==
+                null &&
+              typeof delta.reasoning_content !==
+                "string"
             ) {
               delta.reasoning_content =
                 String(
@@ -376,15 +632,19 @@ function normalizeChatResponseObject(obj) {
 
           if (
             choice.message &&
-            typeof choice.message === "object"
+            typeof choice.message ===
+              "object"
           ) {
             const message =
               choice.message;
 
             if (
-              message.content !== undefined &&
-              message.content !== null &&
-              typeof message.content !== "string"
+              message.content !==
+                undefined &&
+              message.content !==
+                null &&
+              typeof message.content !==
+                "string"
             ) {
               message.content =
                 String(
@@ -393,9 +653,12 @@ function normalizeChatResponseObject(obj) {
             }
 
             if (
-              message.reasoning_content !== undefined &&
-              message.reasoning_content !== null &&
-              typeof message.reasoning_content !== "string"
+              message.reasoning_content !==
+                undefined &&
+              message.reasoning_content !==
+                null &&
+              typeof message.reasoning_content !==
+                "string"
             ) {
               message.reasoning_content =
                 String(
@@ -413,7 +676,7 @@ function normalizeChatResponseObject(obj) {
 }
 
 // ============================================================
-// Build Cloudflare chat payload
+// Build Chat payload
 // ============================================================
 
 function buildChatPayload(
@@ -422,21 +685,32 @@ function buildChatPayload(
   messages,
   isStream
 ) {
-  const maxTokens =
-    resolveMaxTokens(
-      reqBody,
-      model
+  const tokenInfo =
+    calculateMaxTokens(
+      model,
+      messages,
+      reqBody
     );
+
+  if (
+    tokenInfo.error
+  ) {
+    return {
+      payload: null,
+      tokenInfo
+    };
+  }
 
   const payload = {
     model,
     messages,
     stream: isStream,
-    max_tokens: maxTokens
+    max_tokens:
+      tokenInfo.maxTokens
   };
 
   // ----------------------------------------------------------
-  // Forward supported generation parameters
+  // Generation parameters
   // ----------------------------------------------------------
 
   const forwardParams = [
@@ -453,23 +727,52 @@ function buildChatPayload(
   ];
 
   for (
-    const key of forwardParams
+    const key of
+      forwardParams
   ) {
     if (
-      reqBody?.[key] !== undefined
+      reqBody?.[key] !==
+      undefined
     ) {
       payload[key] =
         reqBody[key];
     }
   }
 
-  return payload;
+  // ----------------------------------------------------------
+  // Function calling / agent support
+  //
+  // Useful for coding agents and VS Code integrations.
+  // Only copied when the client actually sends them.
+  // ----------------------------------------------------------
+
+  const toolParams = [
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls"
+  ];
+
+  for (
+    const key of
+      toolParams
+  ) {
+    if (
+      reqBody?.[key] !==
+      undefined
+    ) {
+      payload[key] =
+        reqBody[key];
+    }
+  }
+
+  return {
+    payload,
+    tokenInfo
+  };
 }
 
 // ============================================================
 // CHAT COMPLETIONS
-//
-// Qwen3 + Granite
 // ============================================================
 
 app.post(
@@ -477,7 +780,8 @@ app.post(
   async (req, res) => {
 
     const isStream =
-      req.body?.stream === true;
+      req.body?.stream ===
+      true;
 
     // --------------------------------------------------------
     // Resolve model
@@ -501,7 +805,10 @@ app.post(
     // Build payload
     // --------------------------------------------------------
 
-    const payload =
+    const {
+      payload,
+      tokenInfo
+    } =
       buildChatPayload(
         req.body,
         model,
@@ -510,7 +817,7 @@ app.post(
       );
 
     // --------------------------------------------------------
-    // Debug log
+    // Log incoming request
     // --------------------------------------------------------
 
     console.log(
@@ -542,8 +849,23 @@ app.post(
     );
 
     console.log(
-      "RESOLVED max_tokens:",
-      payload.max_tokens
+      "Estimated input tokens:",
+      tokenInfo.estimatedInputTokens
+    );
+
+    console.log(
+      "Available output tokens:",
+      tokenInfo.availableOutputTokens
+    );
+
+    console.log(
+      "Client requested max_tokens:",
+      tokenInfo.clientRequested
+    );
+
+    console.log(
+      "Resolved max_tokens:",
+      tokenInfo.maxTokens
     );
 
     console.log(
@@ -554,9 +876,10 @@ app.post(
     console.log(
       "Input chars:",
       messages.reduce(
-        (total, m) =>
+        (total, message) =>
           total +
-          m.content.length,
+          message.content
+            .length,
         0
       )
     );
@@ -566,21 +889,60 @@ app.post(
       req.body?.stream_options
     );
 
+    // --------------------------------------------------------
+    // Payload error
+    // --------------------------------------------------------
+
+    if (
+      tokenInfo.error
+    ) {
+      console.error(
+        "CONTEXT ERROR:",
+        tokenInfo.error
+      );
+
+      return res
+        .status(400)
+        .json({
+          error: {
+            message:
+              tokenInfo.error
+          }
+        });
+    }
+
+    // --------------------------------------------------------
+    // Final payload log
+    // --------------------------------------------------------
+
     console.log(
       "FINAL CLOUDFLARE PAYLOAD:",
       JSON.stringify({
-        model: payload.model,
-        stream: payload.stream,
+        model:
+          payload.model,
+
+        stream:
+          payload.stream,
+
         max_tokens:
           payload.max_tokens,
+
         temperature:
           payload.temperature,
+
         top_p:
           payload.top_p,
+
         top_k:
           payload.top_k,
+
         stream_options:
-          payload.stream_options
+          payload.stream_options,
+
+        has_tools:
+          Array.isArray(
+            payload.tools
+          )
       })
     );
 
@@ -589,7 +951,7 @@ app.post(
     );
 
     // --------------------------------------------------------
-    // Cloudflare URL
+    // Cloudflare endpoint
     // --------------------------------------------------------
 
     const cfUrl =
@@ -597,7 +959,7 @@ app.post(
       `${CF_ACCOUNT}/ai/v1/chat/completions`;
 
     // --------------------------------------------------------
-    // Abort upstream when client disconnects
+    // AbortController
     // --------------------------------------------------------
 
     const controller =
@@ -610,7 +972,7 @@ app.post(
           !res.writableEnded
         ) {
           console.warn(
-            "CLIENT DISCONNECTED -> abort Cloudflare request"
+            "CLIENT DISCONNECTED -> aborting Cloudflare request"
           );
 
           controller.abort();
@@ -652,7 +1014,6 @@ app.post(
           "no"
         );
 
-        // Flush immediately
         if (
           typeof res.flushHeaders ===
           "function"
@@ -661,7 +1022,7 @@ app.post(
         }
 
         // ----------------------------------------------------
-        // Cloudflare streaming request
+        // Call Cloudflare
         // ----------------------------------------------------
 
         const cfRes =
@@ -704,11 +1065,12 @@ app.post(
         );
 
         // ----------------------------------------------------
-        // Cloudflare error
+        // Cloudflare HTTP error
         // ----------------------------------------------------
 
-        if (!cfRes.ok) {
-
+        if (
+          !cfRes.ok
+        ) {
           const errorText =
             await cfRes.text();
 
@@ -745,11 +1107,12 @@ app.post(
         }
 
         // ----------------------------------------------------
-        // Empty body
+        // No upstream body
         // ----------------------------------------------------
 
-        if (!cfRes.body) {
-
+        if (
+          !cfRes.body
+        ) {
           console.error(
             "CF STREAM ERROR: empty response body"
           );
@@ -780,20 +1143,7 @@ app.post(
         }
 
         // ----------------------------------------------------
-        // SSE compatibility parser
-        //
-        // We parse SSE only so we can normalize Qwen
-        // non-string delta.content.
-        //
-        // We preserve:
-        //   usage
-        //   finish_reason
-        //   reasoning_content
-        //   token_ids
-        //   model
-        //   id
-        //   created
-        //   other fields
+        // SSE parser / compatibility layer
         // ----------------------------------------------------
 
         const reader =
@@ -815,13 +1165,19 @@ app.post(
           } =
             await reader.read();
 
-          if (done) {
+          if (
+            done
+          ) {
             break;
           }
 
           if (!value) {
             continue;
           }
+
+          // --------------------------------------------------
+          // Decode incoming bytes
+          // --------------------------------------------------
 
           buffer +=
             decoder.decode(
@@ -831,48 +1187,50 @@ app.post(
               }
             );
 
-          // --------------------------------------------------
-          // SSE normally uses blank line to terminate event.
-          //
-          // Process complete lines.
-          // --------------------------------------------------
-
           const lines =
             buffer.split(
               /\r?\n/
             );
 
+          // --------------------------------------------------
           // Keep incomplete final line
+          // --------------------------------------------------
+
           buffer =
-            lines.pop() || "";
+            lines.pop() ||
+            "";
+
+          // --------------------------------------------------
+          // Process complete lines
+          // --------------------------------------------------
 
           for (
-            const line of lines
+            const line of
+              lines
           ) {
 
-            // ------------------------------------------------
-            // Empty SSE separator
-            // ------------------------------------------------
-
+            // Empty separator
             if (
-              line.trim() === ""
+              line.trim() ===
+              ""
             ) {
               continue;
             }
 
             // ------------------------------------------------
-            // SSE comment
+            // SSE comments
             // ------------------------------------------------
 
             if (
-              line.startsWith(":")
+              line.startsWith(
+                ":"
+              )
             ) {
-              // We don't need to forward provider comments.
               continue;
             }
 
             // ------------------------------------------------
-            // Ignore non-data SSE fields
+            // Only data lines
             // ------------------------------------------------
 
             if (
@@ -893,7 +1251,8 @@ app.post(
             // ------------------------------------------------
 
             if (
-              data === "[DONE]"
+              data ===
+              "[DONE]"
             ) {
 
               receivedDone =
@@ -927,7 +1286,7 @@ app.post(
                   data
                 );
 
-            } catch (e) {
+            } catch (error) {
 
               console.warn(
                 "Skipping malformed SSE JSON:",
@@ -938,7 +1297,7 @@ app.post(
             }
 
             // ------------------------------------------------
-            // Normalize ONLY compatibility-sensitive fields
+            // Normalize provider-specific type differences
             // ------------------------------------------------
 
             chunk =
@@ -947,7 +1306,7 @@ app.post(
               );
 
             // ------------------------------------------------
-            // Forward normalized chunk
+            // Send normalized SSE
             // ------------------------------------------------
 
             if (
@@ -964,23 +1323,28 @@ app.post(
         }
 
         // ----------------------------------------------------
-        // Flush remaining buffered data
+        // Flush decoder
         // ----------------------------------------------------
 
         buffer +=
           decoder.decode();
 
+        // ----------------------------------------------------
+        // Process remaining line
+        // ----------------------------------------------------
+
         if (
           buffer.trim()
         ) {
 
-          const remaining =
+          const remainingLines =
             buffer.split(
               /\r?\n/
             );
 
           for (
-            const line of remaining
+            const line of
+              remainingLines
           ) {
 
             if (
@@ -997,7 +1361,8 @@ app.post(
                 .trim();
 
             if (
-              data === "[DONE]"
+              data ===
+              "[DONE]"
             ) {
 
               receivedDone =
@@ -1040,7 +1405,7 @@ app.post(
                 );
               }
 
-            } catch (e) {
+            } catch (error) {
 
               console.warn(
                 "Skipping final malformed SSE JSON:",
@@ -1051,7 +1416,7 @@ app.post(
         }
 
         // ----------------------------------------------------
-        // Append DONE only if Cloudflare omitted it
+        // Ensure DONE
         // ----------------------------------------------------
 
         if (
@@ -1125,7 +1490,9 @@ app.post(
       // Cloudflare error
       // ------------------------------------------------------
 
-      if (!cfRes.ok) {
+      if (
+        !cfRes.ok
+      ) {
 
         console.error(
           "CF ERROR:",
@@ -1145,10 +1512,7 @@ app.post(
       }
 
       // ------------------------------------------------------
-      // Normalize JSON response
-      //
-      // This protects Cherry from the same content type issue
-      // if Qwen ever returns numeric message.content.
+      // Parse / normalize JSON response
       // ------------------------------------------------------
 
       try {
@@ -1172,10 +1536,13 @@ app.post(
           data
         );
 
-      } catch (e) {
+      } catch (error) {
 
-        // If Cloudflare returned something unexpected,
-        // preserve the original response.
+        console.warn(
+          "Cloudflare returned non-JSON response:",
+          text
+        );
+
         res.setHeader(
           "Content-Type",
           "application/json"
@@ -1186,19 +1553,23 @@ app.post(
         );
       }
 
-    } catch (e) {
+    } catch (error) {
+
+      // ======================================================
+      // General error
+      // ======================================================
 
       console.error(
         "CHAT ERROR:",
-        e
+        error
       );
 
       // ------------------------------------------------------
-      // AbortError = client disconnected
+      // Client disconnected
       // ------------------------------------------------------
 
       if (
-        e?.name ===
+        error?.name ===
         "AbortError"
       ) {
 
@@ -1213,7 +1584,9 @@ app.post(
       // Streaming error
       // ------------------------------------------------------
 
-      if (isStream) {
+      if (
+        isStream
+      ) {
 
         if (
           !res.headersSent
@@ -1224,11 +1597,10 @@ app.post(
             .json({
               error: {
                 message:
-                  e?.message ||
+                  error?.message ||
                   "Streaming error"
               }
             });
-
         }
 
         if (
@@ -1242,7 +1614,7 @@ app.post(
                 {
                   error: {
                     message:
-                      e?.message ||
+                      error?.message ||
                       "Streaming error"
                   }
                 }
@@ -1256,7 +1628,7 @@ app.post(
             res.end();
 
           } catch (_) {
-            // Connection already closed
+            // Client already disconnected
           }
         }
 
@@ -1264,7 +1636,7 @@ app.post(
       }
 
       // ------------------------------------------------------
-      // Non-streaming error
+      // Normal error
       // ------------------------------------------------------
 
       if (
@@ -1276,7 +1648,7 @@ app.post(
           .json({
             error: {
               message:
-                e?.message ||
+                error?.message ||
                 "Request failed"
             }
           });
@@ -1288,7 +1660,7 @@ app.post(
 // ============================================================
 // FLUX.2 Klein 4B IMAGE HANDLER
 //
-// Kept independent from Qwen / Granite chat route.
+// Kept separate from Qwen / Granite chat route.
 // ============================================================
 
 async function handleImage(
@@ -1355,7 +1727,7 @@ async function handleImage(
       height
     );
 
-    // FLUX.2 Klein 4B
+    // Keep your existing 4-step FLUX configuration
     form.append(
       "steps",
       "4"
@@ -1365,7 +1737,9 @@ async function handleImage(
     // IMG2IMG
     // --------------------------------------------------------
 
-    if (imgInput) {
+    if (
+      imgInput
+    ) {
 
       const inputString =
         String(
@@ -1373,8 +1747,11 @@ async function handleImage(
         );
 
       const b64 =
-        inputString.includes(",")
-          ? inputString.split(",")[1]
+        inputString.includes(
+          ","
+        )
+          ? inputString
+              .split(",")[1]
           : inputString;
 
       const buffer =
@@ -1385,6 +1762,7 @@ async function handleImage(
 
       form.append(
         "image",
+
         new Blob(
           [buffer],
           {
@@ -1392,11 +1770,13 @@ async function handleImage(
               "image/jpeg"
           }
         ),
+
         "input.jpg"
       );
 
       form.append(
         "strength",
+
         String(
           req.body?.strength ??
           0.5
@@ -1416,7 +1796,7 @@ async function handleImage(
     }
 
     // --------------------------------------------------------
-    // Cloudflare FLUX endpoint
+    // Cloudflare image API
     // --------------------------------------------------------
 
     const cfUrl =
@@ -1433,9 +1813,8 @@ async function handleImage(
             Authorization:
               `Bearer ${CF_TOKEN}`
 
-            // IMPORTANT:
-            // Do not set Content-Type manually.
-            // fetch() generates the multipart boundary.
+            // Do NOT manually set Content-Type.
+            // fetch() creates multipart boundary.
           },
 
           body:
@@ -1452,10 +1831,12 @@ async function handleImage(
     );
 
     // --------------------------------------------------------
-    // Cloudflare FLUX error
+    // Cloudflare image error
     // --------------------------------------------------------
 
-    if (!cfRes.ok) {
+    if (
+      !cfRes.ok
+    ) {
 
       console.error(
         "CF KLEIN ERROR:",
@@ -1475,7 +1856,7 @@ async function handleImage(
     }
 
     // --------------------------------------------------------
-    // Parse image response
+    // Parse image JSON
     // --------------------------------------------------------
 
     let data;
@@ -1487,7 +1868,7 @@ async function handleImage(
           text
         );
 
-    } catch (e) {
+    } catch (error) {
 
       console.error(
         "FLUX JSON PARSE ERROR:",
@@ -1521,11 +1902,11 @@ async function handleImage(
       ]
     });
 
-  } catch (e) {
+  } catch (error) {
 
     console.error(
       "FINAL IMAGE ERROR:",
-      e
+      error
     );
 
     if (
@@ -1537,7 +1918,7 @@ async function handleImage(
         .json({
           error: {
             message:
-              e?.message ||
+              error?.message ||
               "Image generation failed"
           }
         });
@@ -1562,27 +1943,32 @@ app.post(
 // ============================================================
 // Express JSON parser error handler
 //
-// Prevent default HTML:
-// <pre>Bad Request</pre>
+// Converts default HTML:
+//
+//   <pre>Bad Request</pre>
+//
+// into JSON.
 // ============================================================
 
 app.use(
   (
-    err,
+    error,
     req,
     res,
     next
   ) => {
 
     if (
-      err instanceof SyntaxError &&
-      err?.status === 400 &&
-      "body" in err
+      error instanceof
+        SyntaxError &&
+      error?.status ===
+        400 &&
+      "body" in error
     ) {
 
       console.error(
         "INVALID JSON BODY:",
-        err.message
+        error.message
       );
 
       return res
@@ -1593,30 +1979,33 @@ app.use(
               "Invalid JSON request body",
 
             detail:
-              err.message
+              error.message
           }
         });
     }
 
     console.error(
       "UNHANDLED EXPRESS ERROR:",
-      err
+      error
     );
 
     if (
       res.headersSent
     ) {
-      return next(err);
+      return next(
+        error
+      );
     }
 
     return res
       .status(
-        err?.status || 500
+        error?.status ||
+          500
       )
       .json({
         error: {
           message:
-            err?.message ||
+            error?.message ||
             "Internal server error"
         }
       });
@@ -1636,7 +2025,8 @@ app.listen(
     );
 
     console.log(
-      `V18 running on port ${PORT}`
+      "V19 running on port",
+      PORT
     );
 
     console.log(
@@ -1655,13 +2045,45 @@ app.listen(
     );
 
     console.log(
-      "Default Qwen max_tokens:",
-      DEFAULT_MAX_TOKENS.QWEN
+      "QWEN context:",
+      MODEL_CONFIG[
+        MODELS.QWEN
+      ].contextWindow
     );
 
     console.log(
-      "Default Granite max_tokens:",
-      DEFAULT_MAX_TOKENS.GRANITE
+      "QWEN default output:",
+      MODEL_CONFIG[
+        MODELS.QWEN
+      ].defaultMaxTokens
+    );
+
+    console.log(
+      "QWEN max output:",
+      MODEL_CONFIG[
+        MODELS.QWEN
+      ].maxOutputTokens
+    );
+
+    console.log(
+      "GRANITE context:",
+      MODEL_CONFIG[
+        MODELS.GRANITE
+      ].contextWindow
+    );
+
+    console.log(
+      "GRANITE default output:",
+      MODEL_CONFIG[
+        MODELS.GRANITE
+      ].defaultMaxTokens
+    );
+
+    console.log(
+      "GRANITE max output:",
+      MODEL_CONFIG[
+        MODELS.GRANITE
+      ].maxOutputTokens
     );
 
     console.log(
